@@ -85,9 +85,16 @@ fn connectAddrTimeout(addr: Io.net.IpAddress, timeout_ms: u32) !Io.net.Stream {
             var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
             const ready = std.posix.poll(&pfd, @intCast(timeout_ms)) catch return error.ConnectFailed;
             if (ready == 0) return error.ConnectTimeout;
-            if (pfd[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP) != 0) {
-                return error.ConnectionRefused;
+            // poll() readiness does not imply success: an async connect failure
+            // is reported via SO_ERROR and need not set POLL.ERR/HUP, so this is
+            // the authoritative check.
+            var so_err: i32 = 0;
+            var so_len: posix.socklen_t = @sizeOf(i32);
+            switch (std.posix.errno(posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&so_err), &so_len))) {
+                .SUCCESS => {},
+                else => return error.ConnectFailed,
             }
+            if (so_err != 0) return error.ConnectionRefused;
         },
         else => |e| return e,
     }
