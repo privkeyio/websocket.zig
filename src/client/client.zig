@@ -47,11 +47,22 @@ fn connectTimeout(io: Io, host: []const u8, port: u16, timeout_ms: u32) !Io.net.
     var lookup_queue = Io.Queue(Io.net.HostName.LookupResult).init(&lookup_buf);
     try host_name.lookup(io, &lookup_queue, .{ .port = port });
 
-    var last_err: anyerror = error.UnknownHostName;
+    // A single deadline spans every resolved address. DNS can return up to 32
+    // records, so giving each attempt a full timeout_ms would let a hostile
+    // relay stretch the total connect wait to 32x timeout_ms and outlast the
+    // shutdown grace. Each attempt gets only the remaining budget; once it is
+    // exhausted we stop and report the last error.
+    const start_ns = Io.Timestamp.now(io, .real).nanoseconds;
+    var last_err: error{ ConnectFailed, ConnectTimeout, UnknownHostName } = error.UnknownHostName;
     while (lookup_queue.getOneUncancelable(io)) |res| switch (res) {
-        .address => |addr| return connectAddrTimeout(addr, timeout_ms) catch |err| {
-            last_err = err;
-            continue;
+        .address => |addr| {
+            const elapsed = @divTrunc(Io.Timestamp.now(io, .real).nanoseconds - start_ns, std.time.ns_per_ms);
+            if (elapsed >= timeout_ms) return error.ConnectTimeout;
+            const remaining: u32 = if (elapsed <= 0) timeout_ms else timeout_ms - @as(u32, @intCast(elapsed));
+            return connectAddrTimeout(addr, remaining) catch |err| {
+                last_err = err;
+                continue;
+            };
         },
         .canonical_name => continue,
     } else |err| switch (err) {
@@ -60,7 +71,7 @@ fn connectTimeout(io: Io, host: []const u8, port: u16, timeout_ms: u32) !Io.net.
     return last_err;
 }
 
-fn connectAddrTimeout(addr: Io.net.IpAddress, timeout_ms: u32) !Io.net.Stream {
+fn connectAddrTimeout(addr: Io.net.IpAddress, timeout_ms: u32) error{ ConnectFailed, ConnectTimeout }!Io.net.Stream {
     const address: posix.Address = switch (addr) {
         .ip4 => |a| .{ .in = .{
             .port = std.mem.nativeToBig(u16, a.port),
@@ -75,7 +86,7 @@ fn connectAddrTimeout(addr: Io.net.IpAddress, timeout_ms: u32) !Io.net.Stream {
     };
 
     const sock_type = posix.SOCK.STREAM | posix.NONBLOCK | posix.CLOEXEC;
-    const fd = try posix.socket(@intCast(address.any.family), sock_type, 0);
+    const fd = posix.socket(@intCast(address.any.family), sock_type, 0) catch return error.ConnectFailed;
     errdefer posix.close(fd);
 
     if (posix.connect(fd, &address.any, address.getOsSockLen())) |_| {
@@ -83,26 +94,31 @@ fn connectAddrTimeout(addr: Io.net.IpAddress, timeout_ms: u32) !Io.net.Stream {
     } else |err| switch (err) {
         error.WouldBlock => {
             var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
-            const ready = std.posix.poll(&pfd, @intCast(timeout_ms)) catch return error.ConnectFailed;
+            // poll()'s timeout is a signed c_int; a misconfigured timeout larger
+            // than INT_MAX would panic on the cast, so clamp instead.
+            const poll_ms: i32 = @intCast(@min(timeout_ms, @as(u32, std.math.maxInt(i32))));
+            const ready = std.posix.poll(&pfd, poll_ms) catch return error.ConnectFailed;
             if (ready == 0) return error.ConnectTimeout;
             // poll() readiness does not imply success: an async connect failure
             // is reported via SO_ERROR and need not set POLL.ERR/HUP, so this is
-            // the authoritative check.
+            // the authoritative check. The specific errno (ETIMEDOUT,
+            // ECONNREFUSED, ...) is collapsed into ConnectFailed rather than
+            // misreported as one particular cause.
             var so_err: i32 = 0;
             var so_len: posix.socklen_t = @sizeOf(i32);
             switch (std.posix.errno(posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&so_err), &so_len))) {
                 .SUCCESS => {},
                 else => return error.ConnectFailed,
             }
-            if (so_err != 0) return error.ConnectionRefused;
+            if (so_err != 0) return error.ConnectFailed;
         },
-        else => |e| return e,
+        else => return error.ConnectFailed,
     }
 
     // The handshake and read/write paths expect a blocking socket.
     const nonblock: usize = @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }));
-    const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
-    _ = try posix.fcntl(fd, posix.F.SETFL, flags & ~nonblock);
+    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return error.ConnectFailed;
+    _ = posix.fcntl(fd, posix.F.SETFL, flags & ~nonblock) catch return error.ConnectFailed;
 
     return .{ .socket = .{ .handle = fd, .address = addr } };
 }
@@ -129,7 +145,8 @@ const HandshakeGuard = struct {
 
     fn watch(fd: posix.socket_t, timeout_ms: u32, wake_r: posix.fd_t) void {
         var pfd = [_]std.posix.pollfd{.{ .fd = wake_r, .events = std.posix.POLL.IN, .revents = 0 }};
-        const ready = std.posix.poll(&pfd, @intCast(timeout_ms)) catch return;
+        const poll_ms: i32 = @intCast(@min(timeout_ms, @as(u32, std.math.maxInt(i32))));
+        const ready = std.posix.poll(&pfd, poll_ms) catch return;
         if (ready == 0) posix.shutdown(fd, .both) catch {};
     }
 
@@ -173,7 +190,12 @@ pub const Client = struct {
         compression: ?CompressionOpts = null,
         // Upper bound (ms) applied independently to the TCP connect and the TLS
         // handshake, so a blackholed or stalling relay cannot hang init() (and
-        // thus a clean shutdown) indefinitely. Worst case is ~2x this value.
+        // thus a clean shutdown) indefinitely. The real bound on init() is
+        // DNS + connect + handshake: connect and handshake are each bounded by
+        // this value (a single deadline spans all resolved addresses on the
+        // connect side), so the two together are ~2x this value. DNS resolution
+        // is NOT bounded — the Threaded Io cannot cancel host_name.lookup — so a
+        // hung resolver is a known residual outside this bound.
         connect_timeout_ms: u32 = 10000,
     };
 
@@ -196,10 +218,14 @@ pub const Client = struct {
         }
 
         const net_stream = try connectTimeout(io, config.host, config.port, config.connect_timeout_ms);
+        // Own the connected socket for the rest of init: on any later failure
+        // (TLS handshake, buffer-provider create, reader_buf alloc) this closes
+        // the fd so it can't leak on either the TLS or non-TLS path. On success
+        // no errdefer fires and the fd is moved into the returned Client.
+        errdefer net_stream.close(io);
 
         var tls_client: ?*TLSClient = null;
         if (config.tls) {
-            errdefer net_stream.close(io);
             // The TLS handshake reads/writes on a blocking socket, so it cannot
             // be time-bounded from here (a socket receive timeout surfaces as
             // EAGAIN, which std.crypto.tls treats as a bug). A watchdog that
