@@ -52,11 +52,11 @@ fn connectTimeout(io: Io, host: []const u8, port: u16, timeout_ms: u32) !Io.net.
     // relay stretch the total connect wait to 32x timeout_ms and outlast the
     // shutdown grace. Each attempt gets only the remaining budget; once it is
     // exhausted we stop and report the last error.
-    const start_ns = Io.Timestamp.now(io, .real).nanoseconds;
+    const start_ns = Io.Timestamp.now(io, .awake).nanoseconds;
     var last_err: error{ ConnectFailed, ConnectTimeout, UnknownHostName } = error.UnknownHostName;
     while (lookup_queue.getOneUncancelable(io)) |res| switch (res) {
         .address => |addr| {
-            const elapsed = @divTrunc(Io.Timestamp.now(io, .real).nanoseconds - start_ns, std.time.ns_per_ms);
+            const elapsed = @divTrunc(Io.Timestamp.now(io, .awake).nanoseconds - start_ns, std.time.ns_per_ms);
             if (elapsed >= timeout_ms) return error.ConnectTimeout;
             const remaining: u32 = if (elapsed <= 0) timeout_ms else timeout_ms - @as(u32, @intCast(elapsed));
             return connectAddrTimeout(addr, remaining) catch |err| {
