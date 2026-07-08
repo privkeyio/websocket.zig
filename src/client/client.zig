@@ -35,6 +35,105 @@ fn ReadLoopHandler(comptime T: type) type {
     }
 }
 
+// Resolve `host` and connect to `port` with the TCP connect bounded by
+// `timeout_ms`. The Threaded Io panics when asked for a connect timeout, so the
+// connect is driven manually: a non-blocking connect gated by poll(). The
+// returned stream's socket is left in blocking mode for the handshake and read
+// paths.
+fn connectTimeout(io: Io, host: []const u8, port: u16, timeout_ms: u32) !Io.net.Stream {
+    const host_name = try Io.net.HostName.init(host);
+
+    var lookup_buf: [32]Io.net.HostName.LookupResult = undefined;
+    var lookup_queue = Io.Queue(Io.net.HostName.LookupResult).init(&lookup_buf);
+    try host_name.lookup(io, &lookup_queue, .{ .port = port });
+
+    var last_err: anyerror = error.UnknownHostName;
+    while (lookup_queue.getOneUncancelable(io)) |res| switch (res) {
+        .address => |addr| return connectAddrTimeout(addr, timeout_ms) catch |err| {
+            last_err = err;
+            continue;
+        },
+        .canonical_name => continue,
+    } else |err| switch (err) {
+        error.Closed => {},
+    }
+    return last_err;
+}
+
+fn connectAddrTimeout(addr: Io.net.IpAddress, timeout_ms: u32) !Io.net.Stream {
+    const address: posix.Address = switch (addr) {
+        .ip4 => |a| .{ .in = .{
+            .port = std.mem.nativeToBig(u16, a.port),
+            .addr = @bitCast(a.bytes),
+        } },
+        .ip6 => |a| .{ .in6 = .{
+            .port = std.mem.nativeToBig(u16, a.port),
+            .flowinfo = 0,
+            .addr = a.bytes,
+            .scope_id = 0,
+        } },
+    };
+
+    const sock_type = posix.SOCK.STREAM | posix.NONBLOCK | posix.CLOEXEC;
+    const fd = try posix.socket(@intCast(address.any.family), sock_type, 0);
+    errdefer posix.close(fd);
+
+    if (posix.connect(fd, &address.any, address.getOsSockLen())) |_| {
+        // Connected without blocking.
+    } else |err| switch (err) {
+        error.WouldBlock => {
+            var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+            const ready = std.posix.poll(&pfd, @intCast(timeout_ms)) catch return error.ConnectFailed;
+            if (ready == 0) return error.ConnectTimeout;
+            if (pfd[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP) != 0) {
+                return error.ConnectionRefused;
+            }
+        },
+        else => |e| return e,
+    }
+
+    // The handshake and read/write paths expect a blocking socket.
+    const nonblock: usize = @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }));
+    const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
+    _ = try posix.fcntl(fd, posix.F.SETFL, flags & ~nonblock);
+
+    return .{ .socket = .{ .handle = fd, .address = addr } };
+}
+
+// Bounds the TLS handshake: a thread waits up to `timeout_ms` on a wake pipe
+// and, if the handshake has not finished by then, shuts the socket down so the
+// blocking handshake read/write fails instead of hanging. `disarm` wakes the
+// thread and joins it before the socket may be closed, so it never touches a
+// reused fd.
+const HandshakeGuard = struct {
+    wake_r: posix.fd_t,
+    wake_w: posix.fd_t,
+    thread: std.Thread,
+
+    fn arm(fd: posix.socket_t, timeout_ms: u32) !HandshakeGuard {
+        const fds = try posix.pipe2(.{ .CLOEXEC = true });
+        errdefer {
+            posix.close(fds[0]);
+            posix.close(fds[1]);
+        }
+        const thread = try std.Thread.spawn(.{}, watch, .{ fd, timeout_ms, fds[0] });
+        return .{ .wake_r = fds[0], .wake_w = fds[1], .thread = thread };
+    }
+
+    fn watch(fd: posix.socket_t, timeout_ms: u32, wake_r: posix.fd_t) void {
+        var pfd = [_]std.posix.pollfd{.{ .fd = wake_r, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&pfd, @intCast(timeout_ms)) catch return;
+        if (ready == 0) posix.shutdown(fd, .both) catch {};
+    }
+
+    fn disarm(self: *HandshakeGuard) void {
+        _ = posix.write(self.wake_w, "x") catch {};
+        self.thread.join();
+        posix.close(self.wake_r);
+        posix.close(self.wake_w);
+    }
+};
+
 pub const Client = struct {
     io: Io,
     stream: Stream,
@@ -65,6 +164,10 @@ pub const Client = struct {
         mask_fn: *const fn (Io) [4]u8 = generateMask,
         buffer_provider: ?*buffer.Provider = null,
         compression: ?CompressionOpts = null,
+        // Upper bound (ms) applied independently to the TCP connect and the TLS
+        // handshake, so a blackholed or stalling relay cannot hang init() (and
+        // thus a clean shutdown) indefinitely. Worst case is ~2x this value.
+        connect_timeout_ms: u32 = 10000,
     };
 
     pub const HandshakeOpts = struct {
@@ -85,11 +188,18 @@ pub const Client = struct {
             return error.InvalidConfiguraion;
         }
 
-        const host_name = try Io.net.HostName.init(config.host);
-        const net_stream = try host_name.connect(io, config.port, .{ .mode = .stream });
+        const net_stream = try connectTimeout(io, config.host, config.port, config.connect_timeout_ms);
 
         var tls_client: ?*TLSClient = null;
         if (config.tls) {
+            errdefer net_stream.close(io);
+            // The TLS handshake reads/writes on a blocking socket, so it cannot
+            // be time-bounded from here (a socket receive timeout surfaces as
+            // EAGAIN, which std.crypto.tls treats as a bug). A watchdog that
+            // shuts the socket down forces those blocking operations to fail
+            // instead of hanging.
+            var guard = try HandshakeGuard.arm(net_stream.socket.handle, config.connect_timeout_ms);
+            defer guard.disarm();
             tls_client = try TLSClient.init(io, allocator, net_stream, &config);
         }
         const stream = Stream.init(io, net_stream, tls_client);
