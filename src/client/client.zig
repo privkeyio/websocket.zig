@@ -456,42 +456,56 @@ pub const Stream = struct {
         // the socket can be empty (poll would time out) even though data is
         // available in-process, which would starve it.
         if (self.tls_client) |tls_client| {
+            // Bound the retry loop: a hostile relay could flood control records
+            // (or any 0-progress case) and keep stream() returning 0 plaintext.
+            // After this many consecutive 0-plaintext iterations, surface
+            // WouldBlock -> "no message" so the caller can observe shutdown or
+            // staleness and re-enter, instead of spinning here.
+            const max_zero_reads = 16;
             var w: std.Io.Writer = .fixed(buf);
+            var zero_reads: usize = 0;
             while (true) {
-                // Re-evaluate the poll gate on every iteration: stream() can
-                // decrypt a TLS control record (post-handshake NewSessionTicket
-                // or KeyUpdate) and return 0 plaintext without blocking, so an
-                // unguarded retry would busy-spin. Poll each time the plaintext
-                // buffer is empty so a quiet socket blocks up to the timeout
-                // instead of spinning.
-                if (self.read_timeout_ms > 0 and tls_client.client.reader.bufferedLen() == 0) {
-                    var pfd = [_]std.posix.pollfd{.{
-                        .fd = self.stream.socket.handle,
-                        .events = std.posix.POLL.IN,
-                        .revents = 0,
-                    }};
-                    // A poll failure is a real read failure, not "no data":
-                    // surface it (mapped into this read path's error set) rather
-                    // than swallowing it.
-                    const ready = std.posix.poll(&pfd, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
-                    if (ready == 0) return error.WouldBlock;
+                // Poll only when we genuinely need more socket data: both the
+                // decrypted plaintext buffer and the underlying ciphertext
+                // reader are empty. A TLS control record (post-handshake
+                // NewSessionTicket or KeyUpdate) can coalesce in the same TCP
+                // segment as a data record; decrypting it returns 0 plaintext
+                // but drains buffered ciphertext, so gating on plaintext alone
+                // would re-poll and defer an already-buffered data record.
+                // After the control record drains the ciphertext buffer, the
+                // next iteration polls and parks, so this does not spin.
+                if (self.read_timeout_ms > 0 and
+                    tls_client.client.reader.bufferedLen() == 0 and
+                    tls_client.stream_reader.interface.bufferedLen() == 0)
+                {
+                    try self.pollReadable();
                 }
                 const n = try tls_client.client.reader.stream(&w, .limited(buf.len));
                 if (n != 0) {
                     return n;
                 }
+                zero_reads += 1;
+                if (zero_reads >= max_zero_reads) return error.WouldBlock;
             }
         }
         if (self.read_timeout_ms > 0) {
-            var pfd = [_]std.posix.pollfd{.{
-                .fd = self.stream.socket.handle,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const ready = std.posix.poll(&pfd, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
-            if (ready == 0) return error.WouldBlock;
+            try self.pollReadable();
         }
         return posix.read(self.stream.socket.handle, buf);
+    }
+
+    // Poll the socket for readiness up to read_timeout_ms. A poll failure is a
+    // real read failure, not "no data": surface it (mapped into this read
+    // path's error set) rather than swallowing it. A timeout surfaces as
+    // error.WouldBlock, which read() turns into "no message".
+    fn pollReadable(self: *Stream) !void {
+        var pfd = [_]std.posix.pollfd{.{
+            .fd = self.stream.socket.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&pfd, @intCast(self.read_timeout_ms)) catch return error.ReadFailed;
+        if (ready == 0) return error.WouldBlock;
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
